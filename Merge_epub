@@ -1,0 +1,288 @@
+import os
+import zipfile
+import shutil
+import re
+from bs4 import BeautifulSoup
+from xml.etree import ElementTree as ET
+
+def merge_epubs(input_folder, output_file, book_title, book_author):
+    # Получаем список EPUB файлов в папке и сортируем их по числовому значению в имени
+    epub_files = []
+    for filename in os.listdir(input_folder):
+        if filename.endswith('.epub'):
+            match = re.match(r'(\d+)\.epub', filename)
+            if match:
+                number = int(match.group(1))
+                epub_files.append((number, filename))
+    
+    epub_files.sort()
+    
+    if not epub_files:
+        print("Не найдено EPUB файлов в указанной папке.")
+        return
+    
+    print(f"Найдено {len(epub_files)} EPUB файлов для объединения:")
+    for num, filename in epub_files:
+        print(f"{num}: {filename}")
+    
+    # Проверяем наличие файла обложки
+    cover_path = None
+    for ext in ['.jpg', '.jpeg', '.png', '.gif']:
+        test_path = os.path.join(input_folder, f'cover{ext}')
+        if os.path.exists(test_path):
+            cover_path = test_path
+            print(f"Найдена обложка: {os.path.basename(cover_path)}")
+            break
+    
+    # Создаем временную папку для работы
+    temp_dir = os.path.join(input_folder, 'temp_merge')
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    merged_dir = os.path.join(temp_dir, 'merged')
+    os.makedirs(merged_dir, exist_ok=True)
+    
+    # Создаем стандартные файлы EPUB
+    with open(os.path.join(merged_dir, 'mimetype'), 'w', encoding='utf-8') as f:
+        f.write('application/epub+zip')
+    
+    meta_inf_dir = os.path.join(merged_dir, 'META-INF')
+    os.makedirs(meta_inf_dir, exist_ok=True)
+    with open(os.path.join(meta_inf_dir, 'container.xml'), 'w', encoding='utf-8') as f:
+        f.write('''<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>''')
+    
+    oebps_dir = os.path.join(merged_dir, 'OEBPS')
+    os.makedirs(oebps_dir, exist_ok=True)
+    
+    # Копируем обложку и создаем HTML страницу для нее
+    cover_html_path = None
+    cover_id = None
+    if cover_path:
+        cover_ext = os.path.splitext(cover_path)[1].lower()
+        cover_name = f'cover{cover_ext}'
+        cover_dest = os.path.join(oebps_dir, cover_name)
+        shutil.copy2(cover_path, cover_dest)
+        
+        # Создаем HTML страницу с обложкой
+        cover_html = '''<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ru">
+<head>
+    <meta charset="UTF-8"/>
+    <title>Обложка</title>
+    <style type="text/css">
+        body {{ margin: 0; padding: 0; text-align: center; }}
+        img {{ max-width: 100%; max-height: 100%; height: auto; }}
+    </style>
+</head>
+<body>
+    <img src="{cover_name}" alt="Обложка книги"/>
+</body>
+</html>'''.format(cover_name=cover_name)
+        
+        cover_html_path = os.path.join(oebps_dir, 'cover.xhtml')
+        with open(cover_html_path, 'w', encoding='utf-8') as f:
+            f.write(cover_html)
+        
+        cover_id = 'cover-image'
+    
+    # Объединяем содержимое всех EPUB
+    all_html_files = []
+    all_css_files = set()
+    all_images = set()
+    spine_items = []
+    manifest_items = {}
+    current_id = 1
+    
+    # Добавляем обложку в начало, если она есть
+    if cover_html_path:
+        rel_path = os.path.relpath(cover_html_path, oebps_dir)
+        new_id = "cover-page"
+        manifest_items[new_id] = {
+            'href': rel_path,
+            'media-type': 'application/xhtml+xml'
+        }
+        spine_items.append(new_id)
+        all_html_files.append(rel_path)
+        
+        # Добавляем изображение обложки в manifest
+        if cover_id:
+            cover_rel_path = os.path.relpath(cover_dest, oebps_dir)
+            manifest_items[cover_id] = {
+                'href': cover_rel_path,
+                'media-type': f'image/{cover_ext[1:]}'
+            }
+    
+    for num, filename in epub_files:
+        print(f"Обработка файла {filename}...")
+        epub_path = os.path.join(input_folder, filename)
+        
+        temp_epub_dir = os.path.join(temp_dir, f'temp_{num}')
+        os.makedirs(temp_epub_dir, exist_ok=True)
+        
+        with zipfile.ZipFile(epub_path, 'r') as epub_zip:
+            for file in epub_zip.namelist():
+                try:
+                    epub_zip.extract(file, temp_epub_dir)
+                except Exception as e:
+                    print(f"Ошибка при извлечении {file}: {e}")
+                    continue
+        
+        content_dir = None
+        for dirname in os.listdir(temp_epub_dir):
+            if dirname.upper() in ['OEBPS', 'CONTENT']:
+                content_dir = os.path.join(temp_epub_dir, dirname)
+                break
+        
+        if not content_dir:
+            content_dir = temp_epub_dir
+        
+        opf_path = None
+        for root, _, files in os.walk(content_dir):
+            for file in files:
+                if file.endswith('.opf'):
+                    opf_path = os.path.join(root, file)
+                    break
+        
+        if not opf_path:
+            print(f"Не найден файл .opf в {filename}, пропускаем.")
+            continue
+        
+        opf_dir = os.path.dirname(opf_path)
+        with open(opf_path, 'r', encoding='utf-8') as opf_file:
+            opf_content = opf_file.read()
+        
+        soup = BeautifulSoup(opf_content, 'xml')
+        
+        for item in soup.find_all('item'):
+            href = item.get('href')
+            if not href:
+                continue
+            
+            full_path = os.path.normpath(os.path.join(opf_dir, href))
+            if not os.path.exists(full_path):
+                continue
+            
+            rel_path = os.path.relpath(full_path, content_dir)
+            dest_path = os.path.join(oebps_dir, rel_path)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            
+            if href.endswith('.html') or href.endswith('.xhtml'):
+                with open(full_path, 'r', encoding='utf-8') as html_file:
+                    html_content = html_file.read()
+                
+                html_soup = BeautifulSoup(html_content, 'html.parser')
+                
+                with open(dest_path, 'w', encoding='utf-8') as dest_file:
+                    dest_file.write(str(html_soup))
+                
+                new_id = f"html_{current_id}"
+                manifest_items[new_id] = {
+                    'href': rel_path,
+                    'media-type': item.get('media-type')
+                }
+                
+                if item.get('id') in [ref.get('idref') for ref in soup.find_all('itemref')]:
+                    spine_items.append(new_id)
+                
+                all_html_files.append(rel_path)
+                current_id += 1
+            else:
+                shutil.copy2(full_path, dest_path)
+                if href.endswith('.css'):
+                    all_css_files.add(rel_path)
+                elif href.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg')):
+                    all_images.add(rel_path)
+                
+                new_id = f"res_{current_id}"
+                manifest_items[new_id] = {
+                    'href': rel_path,
+                    'media-type': item.get('media-type')
+                }
+                current_id += 1
+    
+    # Создаем content.opf
+    opf_template = '''<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uuid_id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:identifier id="uuid_id">urn:uuid:merged-epub</dc:identifier>
+    <dc:title>{book_title}</dc:title>
+    <dc:creator opf:role="aut">{book_author}</dc:creator>
+    <dc:language>ru</dc:language>
+    <meta property="dcterms:modified">2023-01-01T00:00:00Z</meta>
+    {cover_meta}
+    <meta property="rendition:layout">reflowable</meta>
+  </metadata>
+  <manifest>
+    {manifest_items}
+  </manifest>
+  <spine toc="ncx">
+    {spine_items}
+  </spine>
+  <guide>
+    {guide_reference}
+  </guide>
+</package>
+'''
+    
+    cover_meta = ''
+    guide_reference = ''
+    if cover_html_path:
+        cover_meta = f'<meta name="cover" content="{cover_id}"/>'
+        guide_reference = '''<reference type="cover" title="Обложка" href="cover.xhtml"/>'''
+    
+    manifest_xml = ''
+    for id, item in manifest_items.items():
+        manifest_xml += f'    <item id="{id}" href="{item["href"]}" media-type="{item["media-type"]}"/>\n'
+    
+    spine_xml = ''
+    for id in spine_items:
+        spine_xml += f'    <itemref idref="{id}"/>\n'
+    
+    opf_content = opf_template.format(
+        book_title=book_title,
+        book_author=book_author,
+        cover_meta=cover_meta,
+        guide_reference=guide_reference,
+        manifest_items=manifest_xml,
+        spine_items=spine_xml
+    )
+    
+    with open(os.path.join(oebps_dir, 'content.opf'), 'w', encoding='utf-8') as opf_file:
+        opf_file.write(opf_content)
+    
+    # Создаем новый EPUB
+    print("Создание объединенного EPUB файла...")
+    with zipfile.ZipFile(output_file, 'w') as merged_epub:
+        merged_epub.write(
+            os.path.join(merged_dir, 'mimetype'),
+            'mimetype',
+            compress_type=zipfile.ZIP_STORED
+        )
+        
+        for root, _, files in os.walk(merged_dir):
+            for file in files:
+                if file == 'mimetype':
+                    continue
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, merged_dir)
+                merged_epub.write(full_path, rel_path)
+    
+    shutil.rmtree(temp_dir)
+    
+    print(f"Объединенный EPUB успешно создан: {output_file}")
+
+if __name__ == "__main__":
+    input_folder = input("Введите путь к папке с EPUB файлами: ").strip()
+    output_file = input("Введите имя для результирующего EPUB файла: ").strip()
+    
+    book_title = input("Введите название книги: ").strip()
+    book_author = input("Введите автора книги: ").strip()
+    
+    if not output_file.endswith('.epub'):
+        output_file += '.epub'
+    
+    merge_epubs(input_folder, output_file, book_title, book_author)
